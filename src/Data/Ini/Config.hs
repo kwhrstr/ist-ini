@@ -5,6 +5,7 @@
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE BangPatterns #-}
 
 module Data.Ini.Config where
 
@@ -24,6 +25,9 @@ import qualified RIO.Map as Map
 
 lkp :: NormalizedText -> Seq (NormalizedText, a) -> Maybe a
 lkp name = fmap snd . F.find ((== name) . fst)
+
+lkpI :: NormalizedText -> Seq (NormalizedText, a) -> Maybe Int
+lkpI name = Seq.findIndexL ((== name) . fst)
 
 addLineInformation :: Int -> Text -> (Text -> String)
 addLineInformation lineNo sec  = T.unpack . err
@@ -48,7 +52,7 @@ parseIniFile :: Text -> IniParser a -> Either String a
 parseIniFile text (IniParser mote) = do
   ini <- parseRawIni text
   runReader (runExceptT mote) ini
-
+  
 
 sectionWithConsume :: Text -> SectionParserS a -> IniParser a
 sectionWithConsume secName (SectionParserS thunk) = IniParser $ do
@@ -97,8 +101,14 @@ sectionDef name def (SectionParser thunk) = IniParser $  do
 getSectionName :: StParserR IniSection Text
 getSectionName = ExceptT $ pure . isName <$> ask
 
+getSectionName' :: StParserS IniSection Text
+getSectionName' = ExceptT $ pure . isName <$> get
+
 rawFiledMb :: Text -> StParserR IniSection (Maybe IniValue)
 rawFiledMb name = ExceptT $ pure . lkp (normalize name) . isVals <$> ask
+
+rawFiledIndexMb' :: Text -> StParserS IniSection (Maybe Int)
+rawFiledIndexMb' name = ExceptT $ pure . lkpI (normalize name) . isVals <$> get
 
 rawFiled :: Text -> StParserR IniSection IniValue
 rawFiled name = do
@@ -108,6 +118,20 @@ rawFiled name = do
     Nothing -> throwError . T.unpack $  "Missing field " <> name
                     <> " in section " <> sec
     Just x -> pure x
+
+rawFiled' :: Text -> StParserS IniSection IniValue
+rawFiled' key = do
+  sec <- get
+  secName <- getSectionName'
+  indexMb <- rawFiledIndexMb' key
+  case indexMb of
+    Nothing -> throwError . T.unpack $  "Missing field " <> key
+                    <> " in section " <> secName
+    Just x -> do
+      let !val =  Seq.index (isVals sec)  x
+      modify (\s -> s {isVals = Seq.deleteAt x $ isVals s})
+      pure $ snd val
+
 
 getVal :: IniValue -> Text
 getVal  = T.strip . ivValue
@@ -171,26 +195,8 @@ readable t = case readMaybe $ T.unpack t of
     prx = Proxy @a 
 
 number :: (Num a, Read a, Typeable a) => Text -> Either Text a
-number = readable 
+number = readable
 
-string :: (IsString a) => Text -> Either Text a 
+string :: (IsString a) => Text -> Either Text a
 string = pure . fromString . T.unpack
-
-parsing :: Text
-        -> Map NormalizedText (Text -> Either Text a) 
-        -> IniParser (Seq (NormalizedText, a)) 
-parsing secName m = IniParser $ do
-  RawIni ini <- ask
-  case lkp (normalize secName) ini of
-    Nothing -> throwError $ "No top-level section named " <> show secName
-    Just sec ->
-      forM (isVals sec) $ \p ->
-        case Map.lookup (fst p) m of
-          Nothing -> throwError $ 
-                      addLineInformation (ivLineNo $ snd p)  secName 
-                      $ "undefined key:" <> normalizedText (fst p)
-          Just parse -> do
-            let SectionParser secParse = fieldOf (normalizedText $ fst p) parse
-            parsed <- ExceptT $ pure $ runReader (runExceptT secParse) sec 
-            pure (fst p, parsed)
 
